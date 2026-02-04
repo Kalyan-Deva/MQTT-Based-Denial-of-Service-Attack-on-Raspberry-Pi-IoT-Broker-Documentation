@@ -1,0 +1,368 @@
+\documentclass[11pt]{article}
+
+% -------------------- Packages --------------------
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{graphicx}
+
+% -------------------- Formatting --------------------
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2pt}
+\setlist[itemize]{leftmargin=*, topsep=2pt, itemsep=2pt, parsep=0pt}
+
+\definecolor{codegray}{RGB}{245,245,245}
+\lstdefinestyle{cmd}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  framerule=0.2pt,
+  backgroundcolor=\color{codegray},
+  columns=fullflexible
+}
+% -------------------- Title Info --------------------
+\title{\textbf{MQTT-Based Denial-of-Service Attack on Raspberry Pi IoT Broker}\\
+\large Retained Message Flooding, Wildcard Subscription Storming, and Session Exhaustion}
+
+\author{%
+\textbf{Pallavi Srinivasappa}\\
+M.S. in Computer Information Systems (Cybersecurity)\\
+Boston University
+\and
+\textbf{Kalyan Gopalam}\\
+M.S. in Cybersecurity\\
+Northeastern University
+}
+
+\date{December 12, 2025}
+
+
+
+\begin{document}
+\maketitle
+
+\section{Executive Summary}
+This documentation describes an MQTT-focused Denial-of-Service (DoS) security lab I built and tested using devices I own. The goal was to evaluate how a real IoT-style MQTT deployment behaves when an attacker overwhelms the broker using only valid MQTT operations at extreme scale. I deployed a Mosquitto MQTT broker on a Raspberry Pi 4 (8GB RAM) as the central communication hub, a second Raspberry Pi as a sensor node publishing temperature/humidity/motion readings at fixed intervals, a laptop (WSL) as a wildcard subscriber, and a Kali Linux VM as the attacker.
+
+After confirming stable pre-attack behavior, I executed a multi-vector DoS designed for broker resource exhaustion:
+(1) wildcard subscription storming (topic tree explosion),
+(2) retained message flooding (database + RAM growth),
+and (3) high-frequency connection/session churn (socket/file descriptor pressure).
+The attack was successful: broker memory increased from a stable baseline (\textasciitilde600MB) to full utilization (8GB), inbound traffic spiked from under 1 Mbit/s to sustained 600--700 Mbit/s, legitimate publishers/subscribers experienced delays and message loss, and SSH access to the broker became unresponsive, ending in a complete service outage after approximately 49 minutes.
+
+This report documents my system architecture, baseline metrics, threat model, attack execution, measured impact, and a professional mitigation plan (limits, authentication, ACLs, broker configuration hardening, and network controls). Where I include numeric values that I did not explicitly log, I label them as \textbf{Assumed (for reference)} so the reader can distinguish measured observations from reasonable estimates.
+
+\section{Project Objective and Scope}
+\subsection{Objective}
+The objective of this project was to design, execute, and analyze an MQTT-based DoS attack against a Raspberry Pi IoT broker using protocol-level behavior. I focused on how MQTT features (retained messages and wildcard subscriptions) can be abused to exhaust broker resources.
+
+\subsection{Scope}
+\begin{itemize}
+  \item MQTT broker: Mosquitto on Raspberry Pi 4 (victim).
+  \item Normal IoT workload: sensor node publishes JSON payloads to three topics.
+  \item Attacker workload: custom Python scripts from a Kali Linux VM.
+  \item Target service: MQTT over TCP on port 1883.
+  \item Network: same LAN, 10.0.0.0/23.
+\end{itemize}
+
+\subsection{Out of Scope}
+This project does not attempt remote exploitation of broker vulnerabilities (CVEs), and it does not attempt distributed DoS across many attacker hosts. The emphasis is on how valid MQTT traffic at scale can cause denial-of-service on low-power infrastructure.
+
+\section{MQTT Background (Short and Practical)}
+MQTT is a lightweight publish/subscribe protocol used in IoT for telemetry and command delivery. It has four core components:
+\begin{itemize}
+  \item \textbf{Publisher:} sends messages to topics (e.g., \texttt{sensors/temperature}).
+  \item \textbf{Subscriber:} receives messages by subscribing to topics (supports wildcards like \texttt{sensors/\#}).
+  \item \textbf{Broker:} routes messages between publishers and subscribers, maintains sessions, and can store retained messages.
+  \item \textbf{Topics:} hierarchical strings used for routing (e.g., \texttt{sensors/humidity}).
+\end{itemize}
+
+Two MQTT features are especially relevant to DoS:
+\begin{itemize}
+  \item \textbf{Retained messages:} the broker stores the last retained message for a topic and delivers it to new subscribers.
+  \item \textbf{Wildcards:} subscribers can request broad topic ranges (\texttt{+} and \texttt{\#}), increasing matching workload and state.
+\end{itemize}
+
+\section{System Architecture}
+\subsection{Hardware and Roles}
+\begin{itemize}
+  \item \textbf{Victim Broker:} Raspberry Pi 4 (8GB RAM) running Mosquitto broker on TCP/1883.
+  \item \textbf{Sensor Publisher:} Raspberry Pi (sensor node) publishing JSON payloads:
+  \begin{itemize}
+    \item Temperature every 1 second
+    \item Humidity every 2 seconds
+    \item Motion every 3 seconds
+  \end{itemize}
+  \item \textbf{Subscriber:} Laptop (WSL) subscribing using \texttt{sensors/\#} to validate real-time delivery.
+  \item \textbf{Attacker:} Kali Linux VM executing Python scripts for subscription storms, retained flooding, and connection churn.
+\end{itemize}
+
+\subsection{Topics and Payloads}
+I used three primary topics:
+\begin{itemize}
+  \item \texttt{sensors/temperature}
+  \item \texttt{sensors/humidity}
+  \item \texttt{sensors/motion}
+\end{itemize}
+
+\textbf{Payload format:} Structured JSON strings (\textbf{Assumed (for reference)} typical payload size 100--300 bytes under normal operation).
+
+\subsection{Network Layout}
+All systems communicated over the same local network (10.0.0.0/23). The broker was reachable on TCP/1883. The attacker did not require admin access to the broker; it only needed network connectivity to perform valid MQTT operations at high volume.
+
+\section{Pre-Attack Operational Baseline}
+Before attacking, I validated end-to-end functionality: the sensor publisher produced consistent topic updates, the broker routed messages correctly, and the subscriber received data immediately without drops or delays.
+
+\subsection{Baseline Flow}
+\textbf{Normal behavior:}
+\[
+\text{Sensor Publisher} \rightarrow \text{Broker (TCP/1883)} \rightarrow \text{Subscriber (sensors/\#)}
+\]
+
+\subsection{Baseline Broker Performance}
+Under normal conditions, the broker was lightly loaded:
+\begin{itemize}
+  \item CPU usage: below 5\%
+  \item RAM usage: approximately 500--650 MB
+  \item Network traffic: under 1 Mbit/s
+  \item Logs: standard CONNECT/SUBSCRIBE events, no warnings/errors
+\end{itemize}
+
+\subsection{Baseline Subscriber Experience}
+The WSL subscriber received messages in order with consistent timing and no pauses. This baseline was used to compare behavior during and after the attack.
+
+\section{Threat Model}
+\subsection{Attacker Assumptions}
+In this scenario, the attacker is assumed to be:
+\begin{itemize}
+  \item inside the same network (local adversary), or
+  \item able to reach the broker over the LAN.
+\end{itemize}
+The attacker has no physical access to devices and no administrative credentials. The attack relies on the broker processing large volumes of legitimate MQTT requests.
+
+\subsection{Assets}
+\begin{itemize}
+  \item \textbf{Availability:} broker must accept connections and route messages reliably.
+  \item \textbf{Integrity/Confidentiality:} not the primary focus of this DoS task, but impacted if availability fails.
+  \item \textbf{Operational stability:} CPU/RAM/network resources on the broker.
+\end{itemize}
+
+\subsection{Attack Surface (What I Targeted)}
+\begin{itemize}
+  \item \textbf{Wildcard subscription storms:} inflate routing tables / topic matching workload.
+  \item \textbf{Retained message flooding:} force broker to store large retained datasets and expand topic trees.
+  \item \textbf{Session and connection churn:} exhaust sockets/file descriptors and increase connection overhead.
+  \item \textbf{Network saturation:} overwhelm inbound throughput and increase latency/drops for legitimate traffic.
+\end{itemize}
+
+\section{Attack Design and Execution}
+\subsection{Attack Overview}
+I used custom Python scripts from the Kali VM to run a multi-vector DoS. The primary scripts/behaviors:
+\begin{itemize}
+  \item \textbf{Retained message flood:} generates tens of thousands to hundreds of thousands of retained messages with randomized topics and larger payloads.
+  \item \textbf{Wildcard subscription storm:} creates many MQTT clients subscribing to deeply nested wildcard topics to explode broker state.
+  \item \textbf{Connection/session flood:} rapidly opens/closes sessions to create churn and resource pressure.
+\end{itemize}
+
+\textbf{Payload sizes during attack:} 5KB--50KB (measured/observed range in my environment).
+
+\subsection{Attack Duration and End Condition}
+Total time to full broker failure was approximately \textbf{49 minutes}. The end condition was a complete denial-of-service:
+\begin{itemize}
+  \item broker stopped accepting new MQTT connections,
+  \item subscriber stopped receiving sensor messages,
+  \item publisher messages were not delivered,
+  \item SSH access froze completely,
+  \item broker required manual restart/recovery.
+\end{itemize}
+
+\subsection{Measured Impact (High-Level)}
+\begin{itemize}
+  \item RAM: \textasciitilde600MB baseline $\rightarrow$ 8GB (100\% utilization)
+  \item Network: $<$1 Mbit/s baseline $\rightarrow$ sustained 600--700 Mbit/s inbound
+  \item Connections: broker began denying connections (observed ``denied access by tcpd'' events)
+  \item Reliability: subscriber experienced delays, bursts, long pauses, then complete freeze
+\end{itemize}
+
+\subsection{Attack Vectors Summary Table}
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}lXlX@{}}
+\toprule
+\textbf{Attack Vector} & \textbf{Method} & \textbf{Target} & \textbf{Impact} \\
+\midrule
+Wildcard subscription storm & Thousands of fake subscribers w/ wildcards & Broker RAM/CPU & Topic tree explosion, routing overhead \\
+Retained message flood & Large volumes of retained messages w/ random topics & mosquitto.db, RAM/disk & RAM growth, disk writes, fragmentation \\
+Connection/session flood & High-rate connect/disconnect churn & OS sockets/FDs & Connection drops, backlog growth \\
+Network saturation & Sustained inbound traffic spikes & wlan0 / network stack & Congestion, increased latency, drops \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Observations During the Attack}
+\subsection{Broker Behavior}
+As the attack progressed, Mosquitto consumed increasing memory and the system became unstable:
+\begin{itemize}
+  \item RAM climbed steadily until reaching 100\%.
+  \item Swap usage occurred (\textbf{Assumed (for reference)} if swap enabled: 512MB observed in system view).
+  \item New connections became unreliable; repeated denial/termination events appeared.
+  \item Retained message writes slowed/frequently failed under pressure (\textbf{Assumed (for reference)} based on typical broker behavior when I/O and memory are saturated).
+\end{itemize}
+
+\subsection{Subscriber Behavior (WSL)}
+The subscriber symptoms were clear and progressive:
+\begin{itemize}
+  \item delayed messages and bursty delivery,
+  \item long pauses (seconds to minutes),
+  \item eventual complete loss of sensor data.
+\end{itemize}
+
+\subsection{Publisher Behavior (Sensor Pi)}
+The publisher continued attempting to publish, but delivery failed as broker responsiveness degraded. Once the broker stopped responding, the publisher experienced publish failures (\textbf{Assumed (for reference)} ``broken pipe''-style errors are common when TCP sessions collapse).
+
+\section{Quantitative Results and Reference Values}
+\subsection{Baseline vs Attack Metrics}
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}lXXX@{}}
+\toprule
+\textbf{Metric} & \textbf{Baseline (Pre-Attack)} & \textbf{Under Attack (Peak)} & \textbf{Notes} \\
+\midrule
+CPU usage & $<$5\% & \textbf{Assumed:} 80--100\% & Load rises with routing + I/O + churn \\
+RAM usage & 500--650MB & \textasciitilde8GB (100\%) & Observed full exhaustion \\
+Inbound network & $<$1 Mbit/s & 600--700 Mbit/s & Observed sustained spike \\
+Attack duration to failure & N/A & \textasciitilde49 minutes & Observed time to outage \\
+Total messages processed & N/A & \textbf{Assumed/Observed:} \textasciitilde1,438,730 & Attacker console count during run \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Note:} Values labeled \textbf{Assumed (for reference)} are estimates included to provide realistic magnitude and are not claimed as exact measured results unless explicitly stated.
+
+\section{Root Cause Discussion (Why the Broker Failed)}
+This DoS was effective because MQTT brokers are designed to accept normal volumes of legitimate operations, but they can become vulnerable when those same operations are abused at scale:
+\begin{itemize}
+  \item \textbf{Retained messages} increase persistent state and can expand topic trees significantly.
+  \item \textbf{Wildcard storms} create large subscription sets and heavy matching overhead.
+  \item \textbf{Connection churn} pressures the OS and broker session tables and can exhaust file descriptors.
+  \item \textbf{Raspberry Pi constraints} make exhaustion easier; RAM and I/O saturate faster under extreme workloads.
+\end{itemize}
+
+The final failure mode observed was a classic availability collapse: legitimate publishers/subscribers were starved, the broker stopped accepting connections, the operating system became unresponsive, and SSH froze.
+
+\section{Mitigation and Hardening Plan (Professional Recommendations)}
+Even though my project demonstrates a successful DoS, the most valuable output is a clear hardening plan. The following controls are practical for MQTT brokers in real environments.
+
+\subsection{Broker Configuration Hardening (Mosquitto)}
+\textbf{Recommended baseline:}
+\begin{itemize}
+  \item disable anonymous access and require authentication,
+  \item enforce ACLs to restrict topic permissions,
+  \item impose message size and queue limits,
+  \item reduce retained abuse using limits and operational controls,
+  \item manage session persistence/expiration.
+\end{itemize}
+
+\textbf{Example configuration snippet (adjust to your environment):}
+\begin{lstlisting}[style=cmd]
+# mosquitto.conf (example hardening baseline)
+
+# Authentication + Authorization
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+acl_file /etc/mosquitto/acl
+
+# Limit payload sizes (prevents very large messages)
+message_size_limit 10240          # 10 KB (tune as needed)
+
+# Reduce resource pressure under abusive publish rates
+max_queued_messages 1000          # queued QoS>0 messages
+max_inflight_messages 20
+
+# Optional: reduce persistent session lifetime
+persistent_client_expiration 1d
+
+# Logging (increase visibility during incidents)
+log_type all
+log_dest syslog
+\end{lstlisting}
+
+\textbf{Assumption note:} Some options depend on Mosquitto version; the objective is to enforce resource boundaries and auditability.
+
+\subsection{Network Controls (High Impact)}
+\begin{itemize}
+  \item Restrict broker exposure to trusted IP ranges (deny-by-default).
+  \item Block direct broker access from untrusted devices; place broker behind a gateway where possible.
+  \item Rate-limit or block repeated abusive sources at the firewall.
+\end{itemize}
+
+\textbf{Example UFW rules (illustrative):}
+\begin{lstlisting}[style=cmd]
+sudo ufw default deny incoming
+sudo ufw allow from 10.0.0.0/23 to any port 1883 proto tcp
+sudo ufw enable
+sudo ufw status verbose
+\end{lstlisting}
+
+\subsection{OS-Level Protections}
+\begin{itemize}
+  \item Set file descriptor limits to prevent total OS collapse (\textbf{tune carefully}).
+  \item Monitor CPU/RAM/disk I/O and alert on spikes.
+  \item Separate broker logs and persistence onto reliable storage if possible.
+\end{itemize}
+
+\subsection{TLS and Device Identity (Optional)}
+TLS improves confidentiality/integrity and supports stronger client identity. However, TLS can increase CPU overhead on Raspberry Pi. If enabled, it should be tested under load and combined with network restrictions to reduce unnecessary handshake traffic.
+
+\section{Reproducibility Checklist (My Notes)}
+\begin{itemize}
+  \item Record hardware versions (Pi model/RAM), OS version, Mosquitto version.
+  \item Keep scripts and configs in a Git repo with clear run commands.
+  \item Save attack parameters: number of clients, rates, payload sizes, duration.
+  \item Capture baseline and attack evidence: \texttt{top/htop}, \texttt{free -m}, \texttt{nload}, broker logs, and subscriber output.
+  \item Label results consistently (pre-attack vs during-attack vs post-restart).
+\end{itemize}
+
+\section{Conclusion}
+This project demonstrates how an MQTT-based IoT system can be taken down using only protocol-level behavior and high-volume legitimate operations. In my environment, a multi-vector DoS combining retained-message flooding, wildcard subscription storming, and session churn forced the Mosquitto broker on Raspberry Pi 4 into full resource exhaustion: memory climbed to 100\%, inbound traffic surged to hundreds of Mbit/s, legitimate sensor data stopped flowing, and the broker became unreachable (including SSH).
+
+The key takeaway is that MQTT is efficient and easy to deploy, but without boundaries (authentication, ACLs, quotas, and network restrictions), the broker can be overwhelmed quickly---especially on low-power hardware. The mitigation plan in this document provides a practical baseline for securing MQTT deployments in real IoT environments.
+
+\appendix
+\section{Appendix A: Helpful Commands (Operational)}
+\begin{lstlisting}[style=cmd]
+# Broker status and logs
+sudo systemctl status mosquitto
+sudo journalctl -u mosquitto -f
+
+# Resource monitoring
+top
+free -m
+df -h
+nload
+
+# Confirm broker listening port
+sudo ss -lntp | grep 1883
+
+# Optional capture (verify traffic volume/pattern)
+sudo tcpdump -i wlan0 -w mqtt_attack_capture.pcap port 1883
+\end{lstlisting}
+
+\section{Appendix B: Assumed Values Used for Reference}
+\begin{itemize}
+  \item Normal JSON payload size: 100--300 bytes per sensor message.
+  \item Peak CPU during full saturation: 80--100\% (typical during routing + disk + network pressure).
+  \item Swap visibility: 512MB shown in the baseline view when swap is enabled.
+  \item Publisher failure mode: broken pipe / timeout behavior when broker stops responding.
+\end{itemize}
+
+\end{document}
